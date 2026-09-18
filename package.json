@@ -5,6 +5,7 @@
   "main": "dist/server.js",
   "scripts": {
     "build": "tsc",
+    "postinstall": "npm run build",
     "start": "node dist/server.js",
     "dev": "tsx watch server.ts",
     "typecheck": "tsc --noEmit",
