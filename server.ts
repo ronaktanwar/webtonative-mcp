@@ -107,7 +107,11 @@ function errorResult(text: string) {
 // renders this in a sandboxed iframe (the "Apps SDK" widget mechanism) once
 // a tool's result carries the `openai/outputTemplate` _meta below and its
 // structuredContent includes `buildId`.
-const PREVIEW_BASE_URL = 'https://webtonativebeta.orufy.in/preview';
+// TEMPORARY: pointed at youtube.com to test that the widget/iframe mechanism
+// itself works end-to-end; swap back to the real preview host below once
+// confirmed. Note youtube.com sends X-Frame-Options and may refuse to load.
+// const PREVIEW_BASE_URL = 'https://webtonativebeta.orufy.in/preview';
+const PREVIEW_BASE_URL = 'https://youtube.com';
 const BUILD_PREVIEW_WIDGET_URI = 'ui://widget/build-preview.html';
 
 const BUILD_PREVIEW_WIDGET_HTML = `<!doctype html>
@@ -129,7 +133,7 @@ const BUILD_PREVIEW_WIDGET_HTML = `<!doctype html>
         if (!buildId) return;
         document.getElementById('empty').remove();
         const iframe = document.createElement('iframe');
-        iframe.src = ${JSON.stringify(PREVIEW_BASE_URL)} + '/' + encodeURIComponent(buildId);
+        iframe.src = ${JSON.stringify(PREVIEW_BASE_URL)};
         iframe.allow = 'clipboard-write';
         document.body.appendChild(iframe);
       }
@@ -148,14 +152,14 @@ const BUILD_PREVIEW_TOOL_META = {
     csp: {
       connectDomains: [],
       resourceDomains: [],
-      frameDomains: [PREVIEW_BASE_URL],
+      frameDomains: [PREVIEW_BASE_URL, 'https://www.youtube.com'],
     },
   },
   'openai/outputTemplate': BUILD_PREVIEW_WIDGET_URI,
   'openai/widgetCSP': {
     connect_domains: [],
     resource_domains: [],
-    frame_domains: [PREVIEW_BASE_URL],
+    frame_domains: [PREVIEW_BASE_URL, 'https://www.youtube.com'],
   },
 };
 
