@@ -103,11 +103,82 @@ function errorResult(text: string) {
   return { content: [{ type: 'text' as const, text }], isError: true };
 }
 
+// Preview app shown to the end user for a running/finished build. ChatGPT
+// renders this in a sandboxed iframe (the "Apps SDK" widget mechanism) once
+// a tool's result carries the `openai/outputTemplate` _meta below and its
+// structuredContent includes `buildId`.
+const PREVIEW_BASE_URL = 'https://webtonativebeta.orufy.in/preview';
+const BUILD_PREVIEW_WIDGET_URI = 'ui://widget/build-preview.html';
+
+const BUILD_PREVIEW_WIDGET_HTML = `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      html, body { margin: 0; padding: 0; height: 100%; }
+      iframe { width: 100%; height: 100%; border: 0; display: block; }
+      #empty { font: 14px system-ui, sans-serif; color: #666; padding: 16px; }
+    </style>
+  </head>
+  <body>
+    <div id="empty">Waiting for build details&hellip;</div>
+    <script>
+      function render() {
+        const output = window.openai?.toolOutput;
+        const buildId = output && output.buildId;
+        if (!buildId) return;
+        document.getElementById('empty').remove();
+        const iframe = document.createElement('iframe');
+        iframe.src = ${JSON.stringify(PREVIEW_BASE_URL)} + '/' + encodeURIComponent(buildId);
+        iframe.allow = 'clipboard-write';
+        document.body.appendChild(iframe);
+      }
+      window.addEventListener('openai:set_globals', render);
+      render();
+    </script>
+  </body>
+</html>`;
+
+// _meta shared by every tool result that should open the build-preview
+// iframe: points ChatGPT at the widget resource above and whitelists the
+// preview host so it's allowed to load inside that sandboxed iframe.
+const BUILD_PREVIEW_TOOL_META = {
+  ui: {
+    resourceUri: BUILD_PREVIEW_WIDGET_URI,
+    csp: {
+      connectDomains: [],
+      resourceDomains: [],
+      frameDomains: [PREVIEW_BASE_URL],
+    },
+  },
+  'openai/outputTemplate': BUILD_PREVIEW_WIDGET_URI,
+  'openai/widgetCSP': {
+    connect_domains: [],
+    resource_domains: [],
+    frame_domains: [PREVIEW_BASE_URL],
+  },
+};
+
 function buildServer(): McpServer {
   const server = new McpServer({
     name: 'webtonative-mcp-server',
     version: '1.0.0',
   });
+
+  server.registerResource(
+    'build-preview-widget',
+    BUILD_PREVIEW_WIDGET_URI,
+    { mimeType: 'text/html+skybridge' },
+    async (uri) => ({
+      contents: [
+        {
+          uri: uri.toString(),
+          mimeType: 'text/html+skybridge',
+          text: BUILD_PREVIEW_WIDGET_HTML,
+        },
+      ],
+    }),
+  );
 
   server.registerTool(
     'generate_app',
@@ -143,6 +214,7 @@ function buildServer(): McpServer {
         buildId: z.string().optional(),
         emailId: z.string().optional(),
       },
+      _meta: BUILD_PREVIEW_TOOL_META,
     },
     async ({ websiteUrl, emailId, appName, platform }) => {
       if (platform && platform !== 'android') {
@@ -217,6 +289,7 @@ function buildServer(): McpServer {
         buildId: z.string(),
         status: z.literal('queued'),
       },
+      _meta: BUILD_PREVIEW_TOOL_META,
     },
     async ({ emailId, otp }) => {
       const cookie = getSessionCookie(emailId);
