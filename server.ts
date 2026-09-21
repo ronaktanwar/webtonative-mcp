@@ -145,6 +145,10 @@ function errorResult(text: string) {
 // const PREVIEW_BASE_URL = 'https://webtonativebeta.orufy.in/preview';
 const PREVIEW_BASE_URL =
   "https://www.youtube.com/embed/GICP72POwLA?si=7RxZolnh82MZhdpA";
+// CSP domain allowlists take bare origins only — a full URL with a path/query
+// (like PREVIEW_BASE_URL above) is not a valid CSP source expression and can
+// make the whole declaration get dropped, which blocks ALL nested iframes.
+const PREVIEW_ORIGIN = new URL(PREVIEW_BASE_URL).origin;
 const BUILD_PREVIEW_WIDGET_URI = "ui://widget/build-preview.html";
 
 const BUILD_PREVIEW_WIDGET_HTML = `<!doctype html>
@@ -185,14 +189,14 @@ const BUILD_PREVIEW_TOOL_META = {
     csp: {
       connectDomains: [],
       resourceDomains: [],
-      frameDomains: [PREVIEW_BASE_URL, "https://www.youtube.com"],
+      frameDomains: [PREVIEW_ORIGIN],
     },
   },
   "openai/outputTemplate": BUILD_PREVIEW_WIDGET_URI,
   "openai/widgetCSP": {
     connect_domains: [],
     resource_domains: [],
-    frame_domains: [PREVIEW_BASE_URL, "https://www.youtube.com"],
+    frame_domains: [PREVIEW_ORIGIN],
   },
 };
 
