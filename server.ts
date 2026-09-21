@@ -16,9 +16,11 @@ const API_BASE_URL = (
 ).replace(/\/+$/, '');
 const PORT = Number(process.env.PORT) || 8787;
 
+type BuildStatus = 'pending' | 'building' | 'success' | 'failed';
+
 // `AppBuildHistory.status` enum values (see src/mongo/schema/AppBuildHistory.ts
 // in webtonative-apis) collapsed to the simplified states this MCP server exposes.
-const STATUS_MAP: Record<string, 'pending' | 'building' | 'success' | 'failed'> = {
+const STATUS_MAP: Record<string, BuildStatus> = {
   CAN_GENERATE: 'pending',
   COPY_ASSETS: 'building',
   GENERATE_SPLASH: 'building',
@@ -45,6 +47,23 @@ function deriveAppName(websiteUrl: string): string {
     .replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
+const PLATFORM_TO_PACKAGE_ID = {
+  android: 'ANDROID',
+  ios: 'IOS',
+  both: 'ANDROID_IOS',
+} as const;
+type Platform = keyof typeof PLATFORM_TO_PACKAGE_ID;
+
+// `/build-status` is queried per single platform (android/ios) even for an
+// ANDROID_IOS build — there is no combined value, so a "both" build needs
+// two separate calls that get merged into one result below.
+function aggregateStatus(statuses: BuildStatus[]): BuildStatus {
+  if (statuses.includes('failed')) return 'failed';
+  if (statuses.every((s) => s === 'success')) return 'success';
+  if (statuses.some((s) => s === 'building')) return 'building';
+  return 'pending';
+}
+
 // `/build-app-request` tracks the pending-OTP state server-side in a
 // Redis-backed session, keyed by the `w2n.connect.sid` cookie. This
 // server has no browser to hold that cookie for the user across the
@@ -53,20 +72,23 @@ function deriveAppName(websiteUrl: string): string {
 // TTL (10 minutes, see verifyOrSendBuildAppOtp in core.service.ts) is
 // mirrored so an abandoned entry doesn't linger forever.
 const OTP_SESSION_TTL_MS = 10 * 60 * 1000;
-const pendingOtpSessions = new Map<string, { cookie: string; expiresAt: number }>();
+const pendingOtpSessions = new Map<
+  string,
+  { cookie: string; platform: Platform; expiresAt: number }
+>();
 
-function storeSessionCookie(emailId: string, cookie: string) {
-  pendingOtpSessions.set(emailId, { cookie, expiresAt: Date.now() + OTP_SESSION_TTL_MS });
+function storeSessionCookie(emailId: string, cookie: string, platform: Platform) {
+  pendingOtpSessions.set(emailId, { cookie, platform, expiresAt: Date.now() + OTP_SESSION_TTL_MS });
 }
 
-function getSessionCookie(emailId: string): string | null {
+function getSession(emailId: string): { cookie: string; platform: Platform } | null {
   const entry = pendingOtpSessions.get(emailId);
   if (!entry) return null;
   if (Date.now() > entry.expiresAt) {
     pendingOtpSessions.delete(emailId);
     return null;
   }
-  return entry.cookie;
+  return entry;
 }
 
 function extractSessionCookie(res: Response): string | null {
@@ -187,19 +209,19 @@ function buildServer(): McpServer {
   server.registerTool(
     'generate_app',
     {
-      title: 'Generate Android app from a website',
+      title: 'Generate a native app from a website',
       description:
-        'Submit a website URL to start generating a native Android app (APK) for it. ' +
+        'Submit a website URL to start generating a native app (Android APK and/or iOS) for it. ' +
         'Usually returns a buildId immediately — the build itself runs in the background ' +
         'and is not finished yet when this returns. Call check_build_status with the ' +
-        'returned buildId to track progress and get the final download link. ' +
-        'Occasionally (for a new or unusual-looking email) this instead sends a one-time ' +
-        'code to emailId and returns status "otp_required" — in that case, ask the user ' +
-        'for the code from their email and call verify_build_otp with it.',
+        'returned buildId (and the same platform) to track progress and get the final ' +
+        'download link. Occasionally (for a new or unusual-looking email) this instead sends ' +
+        'a one-time code to emailId and returns status "otp_required" — in that case, ask the ' +
+        'user for the code from their email and call verify_build_otp with it.',
       inputSchema: {
         websiteUrl: z
           .string()
-          .describe('The website URL to convert into an Android app, e.g. https://example.com'),
+          .describe('The website URL to convert into a native app, e.g. https://example.com'),
         emailId: z
           .string()
           .email()
@@ -209,24 +231,23 @@ function buildServer(): McpServer {
           .optional()
           .describe('Display name for the app. Defaults to a name derived from the domain.'),
         platform: z
-          .enum(['android', 'ios'])
+          .enum(['android', 'ios', 'both'])
           .optional()
-          .describe('Target platform. Only "android" is supported today.'),
+          .default('both')
+          .describe(
+            'Which platform(s) to build for. Ask the user if they want Android, iOS, or both ' +
+              '— defaults to "both" if they have no preference.',
+          ),
       },
       outputSchema: {
         status: z.enum(['queued', 'otp_required']),
         buildId: z.string().optional(),
         emailId: z.string().optional(),
+        platform: z.enum(['android', 'ios', 'both']).optional(),
       },
       _meta: BUILD_PREVIEW_TOOL_META,
     },
     async ({ websiteUrl, emailId, appName, platform }) => {
-      if (platform && platform !== 'android') {
-        return errorResult(
-          'Only Android app generation is supported right now. iOS support is not available yet.',
-        );
-      }
-
       let normalizedUrl: string;
       try {
         normalizedUrl = normalizeUrl(websiteUrl);
@@ -241,7 +262,7 @@ function buildServer(): McpServer {
         response = await apiPost('/api/v1/build-app-request', {
           appName: finalAppName,
           emailId,
-          packageId: 'ANDROID',
+          packageId: PLATFORM_TO_PACKAGE_ID[platform],
           websiteUrl: normalizedUrl,
         });
       } catch (err: any) {
@@ -254,9 +275,9 @@ function buildServer(): McpServer {
         // Email/site looked trustworthy enough that the OTP gate was
         // skipped — the build was created directly.
         return textResult(
-          `Build started for ${normalizedUrl}. Build ID: ${result.requestId}. ` +
-            `Call check_build_status with this buildId to check progress.`,
-          { buildId: result.requestId, status: 'queued' },
+          `Build started for ${normalizedUrl} (${platform}). Build ID: ${result.requestId}. ` +
+            `Call check_build_status with this buildId and platform to check progress.`,
+          { buildId: result.requestId, status: 'queued', platform },
         );
       }
 
@@ -264,11 +285,11 @@ function buildServer(): McpServer {
         if (!setCookie) {
           return errorResult('OTP was sent but the session could not be tracked. Please retry.');
         }
-        storeSessionCookie(emailId, setCookie);
+        storeSessionCookie(emailId, setCookie, platform);
         return textResult(
           `A one-time code was sent to ${emailId}. Ask the user for that code, then call ` +
             `verify_build_otp with emailId "${emailId}" and the code to start the build.`,
-          { status: 'otp_required', emailId },
+          { status: 'otp_required', emailId, platform },
         );
       }
 
@@ -292,17 +313,19 @@ function buildServer(): McpServer {
       outputSchema: {
         buildId: z.string(),
         status: z.literal('queued'),
+        platform: z.enum(['android', 'ios', 'both']),
       },
       _meta: BUILD_PREVIEW_TOOL_META,
     },
     async ({ emailId, otp }) => {
-      const cookie = getSessionCookie(emailId);
-      if (!cookie) {
+      const session = getSession(emailId);
+      if (!session) {
         return errorResult(
           'No pending build request found for this email (it may have expired after 10 minutes). ' +
             'Call generate_app again to restart.',
         );
       }
+      const { cookie, platform } = session;
 
       let response: { json: any; setCookie: string | null };
       try {
@@ -316,16 +339,16 @@ function buildServer(): McpServer {
       if (result?.isSuccess && result?.requestId) {
         pendingOtpSessions.delete(emailId);
         return textResult(
-          `Build started. Build ID: ${result.requestId}. ` +
-            `Call check_build_status with this buildId to check progress.`,
-          { buildId: result.requestId, status: 'queued' },
+          `Build started (${platform}). Build ID: ${result.requestId}. ` +
+            `Call check_build_status with this buildId and platform to check progress.`,
+          { buildId: result.requestId, status: 'queued', platform },
         );
       }
 
       if (result?.errorCode === 'MAX_TRIES_EXCEEDED' || result?.errorCode === 'OTP_SESSION_EXPIRED') {
         pendingOtpSessions.delete(emailId);
       } else if (setCookie) {
-        storeSessionCookie(emailId, setCookie);
+        storeSessionCookie(emailId, setCookie, platform);
       }
 
       return errorResult(
@@ -339,60 +362,107 @@ function buildServer(): McpServer {
   server.registerTool(
     'check_build_status',
     {
-      title: 'Check Android build status',
+      title: 'Check native app build status',
       description:
         'Check the status of an app build started with generate_app. Status progresses ' +
         'through pending -> building -> success/failed. If the status is not yet ' +
         '"success" or "failed", wait about 15-20 seconds and call this tool again with ' +
-        'the same buildId. Once status is "success", downloadUrl is a direct link to the APK.',
+        'the same buildId. Once status is "success", the relevant downloadUrl is a direct ' +
+        'link to the build artifact (APK for Android, IPA for iOS). Pass the same platform ' +
+        'that was used with generate_app / verify_build_otp for this buildId.',
       inputSchema: {
         buildId: z.string().describe('The buildId returned by generate_app'),
+        platform: z
+          .enum(['android', 'ios', 'both'])
+          .optional()
+          .default('android')
+          .describe('Which platform(s) this buildId was generated for.'),
       },
       outputSchema: {
         status: z.enum(['pending', 'building', 'success', 'failed']),
         downloadUrl: z.string().nullable(),
+        android: z
+          .object({ status: z.enum(['pending', 'building', 'success', 'failed']), downloadUrl: z.string().nullable() })
+          .optional(),
+        ios: z
+          .object({ status: z.enum(['pending', 'building', 'success', 'failed']), downloadUrl: z.string().nullable() })
+          .optional(),
       },
     },
-    async ({ buildId }) => {
-      let result: any;
-      try {
-        result = await apiGet(
-          `/api/v1/build-status?appId=${encodeURIComponent(buildId)}&platform=android`,
-        );
-      } catch (err: any) {
-        return errorResult(`Failed to reach WebToNative API: ${err?.message || err}`);
+    async ({ buildId, platform }) => {
+      const platformsToQuery: Array<'android' | 'ios'> =
+        platform === 'both' ? ['android', 'ios'] : [platform];
+
+      const fetched = await Promise.all(
+        platformsToQuery.map(async (p) => {
+          try {
+            const result = await apiGet(
+              `/api/v1/build-status?appId=${encodeURIComponent(buildId)}&platform=${p}`,
+            );
+            return { platform: p, result, error: null as string | null };
+          } catch (err: any) {
+            return { platform: p, result: null, error: err?.message || String(err) };
+          }
+        }),
+      );
+
+      const failedFetch = fetched.find((f) => f.error);
+      if (failedFetch) {
+        return errorResult(`Failed to reach WebToNative API: ${failedFetch.error}`);
       }
 
-      if (!result?.isSuccess) {
+      const unsuccessful = fetched.find((f) => !f.result?.isSuccess);
+      if (unsuccessful) {
         return errorResult(
-          `Could not fetch build status: ${result?.err || result?.message || 'unknown error'}`,
+          `Could not fetch build status: ${unsuccessful.result?.err || unsuccessful.result?.message || 'unknown error'}`,
         );
       }
 
-      const history = result.data;
-      if (!history) {
-        return textResult('Build is queued and has not started yet. Try again shortly.', {
-          status: 'pending',
-          downloadUrl: null,
-        });
+      const perPlatform: Record<'android' | 'ios', { status: BuildStatus; downloadUrl: string | null; failureReason?: string; rawStatus?: string }> =
+        {} as any;
+
+      for (const { platform: p, result } of fetched) {
+        const history = result.data;
+        if (!history) {
+          perPlatform[p] = { status: 'pending', downloadUrl: null };
+          continue;
+        }
+        const status = STATUS_MAP[history.status] || 'pending';
+        const downloadUrl =
+          status === 'success'
+            ? p === 'android'
+              ? history.androidApkUrl || history.androidAabUrl || null
+              : history.ipaUrl || null
+            : null;
+        perPlatform[p] = { status, downloadUrl, failureReason: history.failureReason, rawStatus: history.status };
       }
 
-      const status = STATUS_MAP[history.status] || 'pending';
-      const downloadUrl =
-        status === 'success' ? history.androidApkUrl || history.androidAabUrl || null : null;
+      const overallStatus = aggregateStatus(platformsToQuery.map((p) => perPlatform[p].status));
+      const singlePlatform = platformsToQuery.length === 1 ? platformsToQuery[0] : null;
 
-      let text: string;
-      if (status === 'success') {
-        text = downloadUrl
-          ? `Build complete! Download your APK: ${downloadUrl}`
-          : 'Build finished but no download URL was found yet. Try again shortly.';
-      } else if (status === 'failed') {
-        text = `Build failed${history.failureReason ? `: ${history.failureReason}` : '.'}`;
-      } else {
-        text = `Build is still in progress (status: ${history.status}). Check again in about 15-20 seconds.`;
+      const lines = platformsToQuery.map((p) => {
+        const entry = perPlatform[p];
+        const label = p === 'android' ? 'Android' : 'iOS';
+        if (entry.status === 'success') {
+          return entry.downloadUrl
+            ? `${label}: build complete! Download: ${entry.downloadUrl}`
+            : `${label}: build finished but no download URL was found yet.`;
+        }
+        if (entry.status === 'failed') {
+          return `${label}: build failed${entry.failureReason ? `: ${entry.failureReason}` : '.'}`;
+        }
+        return `${label}: still in progress (status: ${entry.rawStatus}).`;
+      });
+      if (overallStatus === 'building' || overallStatus === 'pending') {
+        lines.push('Check again in about 15-20 seconds.');
       }
 
-      return textResult(text, { status, downloadUrl });
+      return textResult(lines.join('\n'), {
+        status: overallStatus,
+        downloadUrl: singlePlatform ? perPlatform[singlePlatform].downloadUrl : null,
+        ...(perPlatform.android ? { android: { status: perPlatform.android.status, downloadUrl: perPlatform.android.downloadUrl } } : {}),
+        ...(perPlatform.ios ? { ios: { status: perPlatform.ios.status, downloadUrl: perPlatform.ios.downloadUrl } } : {}),
+      });
     },
   );
 
