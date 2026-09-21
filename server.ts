@@ -180,19 +180,34 @@ const BUILD_PREVIEW_WIDGET_HTML = `<!doctype html>
   </body>
 </html>`;
 
-// _meta shared by every tool result that should open the build-preview
-// iframe: points ChatGPT at the widget resource above and whitelists the
-// preview host so it's allowed to load inside that sandboxed iframe.
+// _meta on the tool just links it to the widget template — CSP and the
+// widget's own dedicated origin belong on the *resource* below, not here
+// (ChatGPT's app-submission checks look for them on the resource template).
 const BUILD_PREVIEW_TOOL_META = {
+  ui: { resourceUri: BUILD_PREVIEW_WIDGET_URI },
+  "openai/outputTemplate": BUILD_PREVIEW_WIDGET_URI,
+};
+
+// `openai/widgetDomain` (alias for `ui.domain`) must be a unique origin
+// dedicated to this plugin's widgets — it's what ChatGPT sandboxes the
+// rendered iframe under and validates openExternal() targets against.
+// This is our own deployed origin (the /mcp suffix is the endpoint path,
+// not part of the origin).
+const WIDGET_DOMAIN = "https://webtonative-mcp.onrender.com";
+
+// _meta on the widget resource itself: declares its dedicated origin and
+// whitelists the preview host so it's allowed to load inside the sandboxed
+// widget iframe. Required for ChatGPT app-submission validation.
+const BUILD_PREVIEW_RESOURCE_META = {
   ui: {
-    resourceUri: BUILD_PREVIEW_WIDGET_URI,
+    domain: WIDGET_DOMAIN,
     csp: {
       connectDomains: [],
       resourceDomains: [],
       frameDomains: [PREVIEW_ORIGIN],
     },
   },
-  "openai/outputTemplate": BUILD_PREVIEW_WIDGET_URI,
+  "openai/widgetDomain": WIDGET_DOMAIN,
   "openai/widgetCSP": {
     connect_domains: [],
     resource_domains: [],
@@ -209,13 +224,14 @@ function buildServer(): McpServer {
   server.registerResource(
     "build-preview-widget",
     BUILD_PREVIEW_WIDGET_URI,
-    { mimeType: "text/html+skybridge" },
+    { mimeType: "text/html+skybridge", _meta: BUILD_PREVIEW_RESOURCE_META },
     async (uri) => ({
       contents: [
         {
           uri: uri.toString(),
           mimeType: "text/html+skybridge",
           text: BUILD_PREVIEW_WIDGET_HTML,
+          _meta: BUILD_PREVIEW_RESOURCE_META,
         },
       ],
     }),
