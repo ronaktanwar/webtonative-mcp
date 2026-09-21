@@ -138,13 +138,10 @@ function errorResult(text: string) {
 // Preview app shown to the end user for a running/finished build. ChatGPT
 // renders this in a sandboxed iframe (the "Apps SDK" widget mechanism) once
 // a tool's result carries the `openai/outputTemplate` _meta below and its
-// structuredContent includes `buildId`.
-// TEMPORARY: pointed at youtube.com to test that the widget/iframe mechanism
-// itself works end-to-end; swap back to the real preview host below once
-// confirmed. Note youtube.com sends X-Frame-Options and may refuse to load.
-// const PREVIEW_BASE_URL = 'https://webtonativebeta.orufy.in/preview';
-const PREVIEW_BASE_URL =
-  "https://www.youtube.com/embed/GICP72POwLA?si=7RxZolnh82MZhdpA";
+// structuredContent includes `buildId`. The iframe src is this base URL
+// plus `/{buildId}`, e.g. https://webtonativebeta.orufy.in/preview/6aad2e....
+const PREVIEW_BASE_URL = "https://webtonativebeta.orufy.in/preview";
+
 // CSP domain allowlists take bare origins only — a full URL with a path/query
 // (like PREVIEW_BASE_URL above) is not a valid CSP source expression and can
 // make the whole declaration get dropped, which blocks ALL nested iframes.
@@ -170,7 +167,7 @@ const BUILD_PREVIEW_WIDGET_HTML = `<!doctype html>
         if (!buildId) return;
         document.getElementById('empty').remove();
         const iframe = document.createElement('iframe');
-        iframe.src = ${JSON.stringify(PREVIEW_BASE_URL)};
+        iframe.src = ${JSON.stringify(PREVIEW_BASE_URL)} + '/' + encodeURIComponent(buildId);
         iframe.allow = 'clipboard-write';
         document.body.appendChild(iframe);
       }
